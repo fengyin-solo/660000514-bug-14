@@ -1,4 +1,5 @@
 import type { InterviewRoom, ParticipantStatus, CreateRoomRequest, CreateRoomResponse, JoinRoomResponse } from '../types';
+import { canTransitionRoomStatus } from '../types';
 
 const STORAGE_KEY = 'code_interview_rooms';
 
@@ -121,10 +122,21 @@ export async function mockUpdateRoomStatus(roomId: string, status: string): Prom
     throw new Error('房间不存在');
   }
 
+  const current = rooms[index];
+  if (!canTransitionRoomStatus(current.status, status as InterviewRoom['status'])) {
+    throw new Error(`当前状态「${current.status}」不允许变更为「${status}」，状态不能倒退`);
+  }
+
+  const now = new Date().toISOString();
   const updatedRoom: InterviewRoom = {
-    ...rooms[index],
+    ...current,
     status: status as InterviewRoom['status'],
   };
+  if (status === 'ACTIVE' && !updatedRoom.startedAt) {
+    updatedRoom.startedAt = now;
+  } else if ((status === 'COMPLETED' || status === 'CANCELLED') && !updatedRoom.endedAt) {
+    updatedRoom.endedAt = now;
+  }
 
   roomsCache = [...rooms];
   roomsCache[index] = updatedRoom;

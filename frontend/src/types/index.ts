@@ -86,7 +86,7 @@ export interface InterviewRoom {
   problemId: string;
   interviewerId: string;
   candidateId: string;
-  status: 'WAITING' | 'ACTIVE' | 'COMPLETED' | 'CANCELLED';
+  status: RoomStatus;
   createdAt: string;
   endedAt?: string;
   startedAt?: string;
@@ -94,6 +94,44 @@ export interface InterviewRoom {
   language: string;
   chatMessages: ChatMessage[];
 }
+
+/**
+ * 房间状态的唯一口径：列表、详情、状态流转都必须使用这里的定义。
+ * WAITING(等待中) -> ACTIVE(进行中) -> COMPLETED(已完成)
+ *                    └-> CANCELLED(已取消)
+ * COMPLETED / CANCELLED 为终态，不可回退。
+ */
+export type RoomStatus = 'WAITING' | 'ACTIVE' | 'COMPLETED' | 'CANCELLED';
+
+export const ROOM_STATUS_ORDER: Record<RoomStatus, number> = {
+  WAITING: 0,
+  ACTIVE: 1,
+  COMPLETED: 2,
+  CANCELLED: 2,
+};
+
+/** 合法的状态流转表（与后端 InterviewRoomController 保持一致） */
+const VALID_ROOM_STATUS_TRANSITIONS: Record<RoomStatus, RoomStatus[]> = {
+  WAITING: ['ACTIVE', 'CANCELLED'],
+  ACTIVE: ['COMPLETED', 'CANCELLED'],
+  COMPLETED: [],
+  CANCELLED: [],
+};
+
+export const isRoomStatus = (value: unknown): value is RoomStatus => {
+  return typeof value === 'string' && value in ROOM_STATUS_ORDER;
+};
+
+/** 新状态相对当前状态是否允许流转（相同状态视为幂等允许） */
+export const canTransitionRoomStatus = (from: RoomStatus, to: RoomStatus): boolean => {
+  if (from === to) return true;
+  return VALID_ROOM_STATUS_TRANSITIONS[from].includes(to);
+};
+
+/** 状态只能前进不能后退：终态之后收到的旧数据不得覆盖新状态 */
+export const isStatusRegression = (current: RoomStatus, incoming: RoomStatus): boolean => {
+  return ROOM_STATUS_ORDER[incoming] < ROOM_STATUS_ORDER[current];
+};
 
 export interface ChatMessage {
   id: string; senderId: string; senderName: string;
@@ -261,8 +299,8 @@ export const ROOM_STATUS_CONFIGS: RoomStatusConfig[] = [
   },
   {
     value: 'COMPLETED',
-    label: '已结束',
-    description: '面试已结束',
+    label: '已完成',
+    description: '面试已完成',
     icon: '✅',
     color: '#2196f3',
     bgColor: 'rgba(33, 150, 243, 0.15)',
@@ -280,7 +318,18 @@ export const ROOM_STATUS_CONFIGS: RoomStatusConfig[] = [
 ];
 
 export const getRoomStatusConfig = (status: string): RoomStatusConfig => {
-  return ROOM_STATUS_CONFIGS.find(s => s.value === status) || ROOM_STATUS_CONFIGS[0];
+  const config = ROOM_STATUS_CONFIGS.find(s => s.value === status);
+  if (config) return config;
+  // 未知状态必须显式暴露，不能静默回落到 WAITING 造成"对不上"
+  return {
+    value: 'WAITING',
+    label: status ? `未知状态` : '未知状态',
+    description: status ? `收到未知状态：${status}` : '状态缺失',
+    icon: '❓',
+    color: '#9e9e9e',
+    bgColor: 'rgba(158, 158, 158, 0.15)',
+    borderColor: '#9e9e9e',
+  };
 };
 
 export const formatDuration = (startTime: string, endTime?: string): string => {

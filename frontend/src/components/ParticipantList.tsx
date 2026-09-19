@@ -3,6 +3,7 @@ import { getRoomParticipants, updateRoomStatus, getRoomById, heartbeat } from '.
 import { subscribeParticipants, sendHeartbeat, connect, disconnect } from '../services/websocketService';
 import { useInterviewStore } from '../store/interview';
 import { ParticipantStatus, getRoomStatusConfig, formatTime } from '../types';
+import { useToastStore } from '../store/toast';
 
 const formatTimeAgo = (dateString: string): string => {
   const now = new Date().getTime();
@@ -31,10 +32,13 @@ interface ParticipantListProps {
 
 const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
   const { currentUser, participants, setParticipants, currentRoom, setCurrentRoom, invitations } = useInterviewStore();
+  const { error: showError } = useToastStore();
   const [copied, setCopied] = useState(false);
+  const [isChangingStatus, setIsChangingStatus] = useState(false);
   const [joinedNotification, setJoinedNotification] = useState<JoinedNotification | null>(null);
   const prevParticipantsRef = useRef<ParticipantStatus[]>([]);
   const notificationTimerRef = useRef<number | null>(null);
+  const roomFetchSeqRef = useRef(0);
 
   const fetchParticipants = useCallback(async () => {
     try {
@@ -46,10 +50,14 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
   }, [roomId, setParticipants]);
 
   const fetchRoomDetails = useCallback(async () => {
+    const seq = ++roomFetchSeqRef.current;
     try {
       const data = await getRoomById(roomId);
-      setCurrentRoom(data);
+      if (seq === roomFetchSeqRef.current) {
+        setCurrentRoom(data);
+      }
     } catch (error) {
+      // 轮询失败不打扰用户（详情页有显式错误态），但不得清掉已有状态
       console.error('Failed to fetch room details:', error);
     }
   }, [roomId, setCurrentRoom]);
@@ -63,23 +71,24 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
     }
   }, [roomId, currentUser]);
 
-  const handleStartInterview = async () => {
+  const changeStatus = async (status: 'ACTIVE' | 'COMPLETED', actionLabel: string) => {
+    if (isChangingStatus) return;
+    setIsChangingStatus(true);
     try {
-      const updatedRoom = await updateRoomStatus(roomId, 'ACTIVE');
+      const updatedRoom = await updateRoomStatus(roomId, status);
       setCurrentRoom(updatedRoom);
     } catch (error) {
-      console.error('Failed to start interview:', error);
+      const message = error instanceof Error ? error.message : `${actionLabel}失败`;
+      console.error(`Failed to ${actionLabel} interview:`, error);
+      showError(`${actionLabel}失败：${message}`);
+    } finally {
+      setIsChangingStatus(false);
     }
   };
 
-  const handleEndInterview = async () => {
-    try {
-      const updatedRoom = await updateRoomStatus(roomId, 'COMPLETED');
-      setCurrentRoom(updatedRoom);
-    } catch (error) {
-      console.error('Failed to end interview:', error);
-    }
-  };
+  const handleStartInterview = () => changeStatus('ACTIVE', '开始');
+
+  const handleEndInterview = () => changeStatus('COMPLETED', '完成');
 
   const handleCopyRoomCode = async () => {
     if (!currentRoom?.roomCode) return;
@@ -397,6 +406,7 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
                 {currentRoom.status === 'WAITING' && (
                   <button
                     onClick={handleStartInterview}
+                    disabled={isChangingStatus}
                     style={{
                       flex: 1,
                       padding: '10px 16px',
@@ -406,16 +416,18 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
                       color: '#fff',
                       border: 'none',
                       borderRadius: '6px',
-                      cursor: 'pointer',
+                      cursor: isChangingStatus ? 'not-allowed' : 'pointer',
+                      opacity: isChangingStatus ? 0.7 : 1,
                       transition: 'background-color 0.2s',
                     }}
                   >
-                    开始面试
+                    {isChangingStatus ? '处理中...' : '开始面试'}
                   </button>
                 )}
                 {currentRoom.status === 'ACTIVE' && (
                   <button
                     onClick={handleEndInterview}
+                    disabled={isChangingStatus}
                     style={{
                       flex: 1,
                       padding: '10px 16px',
@@ -425,11 +437,12 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
                       color: '#fff',
                       border: 'none',
                       borderRadius: '6px',
-                      cursor: 'pointer',
+                      cursor: isChangingStatus ? 'not-allowed' : 'pointer',
+                      opacity: isChangingStatus ? 0.7 : 1,
                       transition: 'background-color 0.2s',
                     }}
                   >
-                    结束面试
+                    {isChangingStatus ? '处理中...' : '完成面试'}
                   </button>
                 )}
               </div>

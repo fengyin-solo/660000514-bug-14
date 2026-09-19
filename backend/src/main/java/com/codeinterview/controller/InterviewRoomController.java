@@ -21,6 +21,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
+import java.util.Set;
+import java.util.HashMap;
 
 @RestController
 @RequestMapping("/api/interview-rooms")
@@ -41,6 +43,15 @@ public class InterviewRoomController {
 
     private static final String ROOM_CODE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final int ROOM_CODE_LENGTH = 6;
+
+    /** 房间状态机：等待 -> 进行 -> 完成/取消，完成与取消为终态，任何状态都不可倒退 */
+    private static final Map<String, Set<String>> ALLOWED_STATUS_TRANSITIONS = new HashMap<>();
+    static {
+        ALLOWED_STATUS_TRANSITIONS.put("WAITING", Set.of("ACTIVE", "CANCELLED"));
+        ALLOWED_STATUS_TRANSITIONS.put("ACTIVE", Set.of("COMPLETED", "CANCELLED"));
+        ALLOWED_STATUS_TRANSITIONS.put("COMPLETED", Set.of());
+        ALLOWED_STATUS_TRANSITIONS.put("CANCELLED", Set.of());
+    }
 
     @PostMapping
     @Transactional
@@ -103,7 +114,24 @@ public class InterviewRoomController {
             return new ResponseEntity<>(HttpStatus.NOT_FOUND);
         }
 
+        if (!ALLOWED_STATUS_TRANSITIONS.containsKey(status)) {
+            return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
+        }
+
         InterviewRoom room = roomOpt.get();
+        String currentStatus = room.getStatus();
+
+        // 幂等：重复提交相同状态直接返回当前房间
+        if (currentStatus.equals(status)) {
+            return new ResponseEntity<>(room, HttpStatus.OK);
+        }
+
+        Set<String> allowed = ALLOWED_STATUS_TRANSITIONS.get(currentStatus);
+        if (allowed == null || !allowed.contains(status)) {
+            // 状态不能倒退（含完成/取消互相切换）
+            return new ResponseEntity<>(HttpStatus.CONFLICT);
+        }
+
         room.setStatus(status);
 
         if ("ACTIVE".equals(status) && room.getStartedAt() == null) {
@@ -113,6 +141,11 @@ public class InterviewRoomController {
         }
 
         InterviewRoom updatedRoom = interviewRoomRepository.save(room);
+
+        // 广播给房间内所有客户端，保证面试官列表、候选人详情看到的状态一致
+        messagingTemplate.convertAndSend("/topic/room/" + roomId + "/status",
+                new WebSocketMessage<>("ROOM_STATUS", updatedRoom));
+
         return new ResponseEntity<>(updatedRoom, HttpStatus.OK);
     }
 
@@ -133,6 +166,11 @@ public class InterviewRoomController {
             return new ResponseEntity<>(HttpStatus.NOT_FOUND);
         }
         InterviewRoom room = roomOpt.get();
+
+        // 已完成或已取消的房间是终态，不允许候选人再加入
+        if ("COMPLETED".equals(room.getStatus()) || "CANCELLED".equals(room.getStatus())) {
+            return new ResponseEntity<>(HttpStatus.CONFLICT);
+        }
 
         String message = "Joined via room code";
 

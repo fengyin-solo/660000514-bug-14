@@ -10,6 +10,7 @@ import { ParticipantStatus, getRoomStatusConfig, formatDuration, formatTime } fr
 import { getRoomById, updateRoomStatus, getRoomParticipants, heartbeat } from '../services/interviewRoomService';
 import { connect, disconnect, subscribeParticipants, subscribeRoomStatus, sendHeartbeat } from '../services/websocketService';
 import { getProblemById } from '../services/problemService';
+import { useToastStore } from '../store/toast';
 
 export const InterviewerRoomView: React.FC = () => {
   const { roomId } = useParams<{ roomId: string }>();
@@ -30,6 +31,11 @@ export const InterviewerRoomView: React.FC = () => {
   const [showInvitePanel, setShowInvitePanel] = useState(true);
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  // 显式区分"房间不存在(404)"与"加载失败(网络/服务器)"，失败必须可见并可重试
+  const [loadError, setLoadError] = useState('');
+  const [roomNotFound, setRoomNotFound] = useState(false);
+  const [problemError, setProblemError] = useState(false);
+  const [isChangingStatus, setIsChangingStatus] = useState(false);
   const [duration, setDuration] = useState<string>('');
   const [localStatusNotification, setLocalStatusNotification] = useState<StatusChangeNotification | null>(null);
   const httpHeartbeatRef = useRef<number | null>(null);
@@ -38,18 +44,37 @@ export const InterviewerRoomView: React.FC = () => {
   const unsubscribeRoomStatusRef = useRef<(() => void) | null>(null);
   const durationTimerRef = useRef<number | null>(null);
   const notificationTimerRef = useRef<number | null>(null);
+  const roomFetchSeqRef = useRef(0);
+  const pollTimerRef = useRef<number | null>(null);
+  const { error: showError, success: showSuccess } = useToastStore();
 
   const fetchRoomDetails = useCallback(async () => {
     if (!roomId) return;
+    const seq = ++roomFetchSeqRef.current;
     try {
       const data = await getRoomById(roomId);
+      if (seq !== roomFetchSeqRef.current) return;
       setCurrentRoom(data);
+      setRoomNotFound(false);
+      setLoadError('');
       if (data.problemId) {
-        const problem = await getProblemById(data.problemId);
-        setProblem(problem);
+        try {
+          const problem = await getProblemById(data.problemId);
+          setProblem(problem);
+          setProblemError(false);
+        } catch (problemErr) {
+          console.error('Failed to fetch problem:', problemErr);
+          setProblemError(true);
+        }
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (seq !== roomFetchSeqRef.current) return;
       console.error('Failed to fetch room details:', error);
+      if (error?.status === 404) {
+        setRoomNotFound(true);
+      } else {
+        setLoadError(error instanceof Error ? error.message : '房间详情加载失败');
+      }
     }
   }, [roomId, setCurrentRoom, setProblem]);
 
@@ -78,15 +103,16 @@ export const InterviewerRoomView: React.FC = () => {
 
     const init = async () => {
       setLoading(true);
+      setLoadError('');
+      setRoomNotFound(false);
       try {
-        if (!currentRoom && roomId) {
-          await fetchRoomDetails();
-        }
+        await fetchRoomDetails();
         await fetchParticipants();
 
         if (currentUser && roomId) {
           try {
             await connect(roomId, currentUser);
+            if (!mounted) return;
             setIsConnected(true);
 
             unsubscribeParticipantsRef.current = subscribeParticipants(roomId, (data) => {
@@ -106,11 +132,10 @@ export const InterviewerRoomView: React.FC = () => {
               if (currentUser) sendHeartbeat(roomId, currentUser);
             }, 30000);
           } catch (error) {
-            console.error('Failed to connect WebSocket:', error);
+            // WebSocket 是实时性增强：失败不影响房间使用，轮询仍可同步状态
+            console.warn('WebSocket unavailable, relying on manual state:', error);
           }
         }
-      } catch (error) {
-        console.error('Failed to initialize room:', error);
       } finally {
         if (mounted) {
           setLoading(false);
@@ -120,8 +145,16 @@ export const InterviewerRoomView: React.FC = () => {
 
     init();
 
+    // WebSocket 不可用时的兜底：轮询同步房间状态（store 合并保证状态不倒退）
+    pollTimerRef.current = window.setInterval(() => {
+      if (mounted) {
+        fetchRoomDetails();
+      }
+    }, 10000);
+
     return () => {
       mounted = false;
+      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
       if (httpHeartbeatRef.current) clearInterval(httpHeartbeatRef.current);
       if (wsHeartbeatRef.current) clearInterval(wsHeartbeatRef.current);
       if (unsubscribeParticipantsRef.current) unsubscribeParticipantsRef.current();
@@ -129,7 +162,7 @@ export const InterviewerRoomView: React.FC = () => {
       disconnect();
       setIsConnected(false);
     };
-  }, [roomId, currentUser, currentRoom, fetchRoomDetails, fetchParticipants, sendHttpHeartbeat, setIsConnected, setCurrentRoom, setParticipants]);
+  }, [roomId, currentUser, fetchRoomDetails, fetchParticipants, sendHttpHeartbeat, setIsConnected, setCurrentRoom, setParticipants]);
 
   const updateDuration = useCallback(() => {
     if (!currentRoom) return;
@@ -194,25 +227,27 @@ export const InterviewerRoomView: React.FC = () => {
     }
   };
 
-  const handleStartInterview = async () => {
-    if (!currentRoom) return;
+  const changeStatus = async (nextStatus: 'ACTIVE' | 'COMPLETED' | 'CANCELLED', actionLabel: string) => {
+    if (!currentRoom || isChangingStatus) return;
+    setIsChangingStatus(true);
     try {
-      const updatedRoom = await updateRoomStatus(currentRoom.id, 'ACTIVE');
+      const updatedRoom = await updateRoomStatus(currentRoom.id, nextStatus);
       setCurrentRoom(updatedRoom);
+      showSuccess(`面试已${actionLabel}`);
     } catch (error) {
-      console.error('Failed to start interview:', error);
+      const message = error instanceof Error ? error.message : `${actionLabel}失败`;
+      console.error(`Failed to ${actionLabel} interview:`, error);
+      showError(`${actionLabel}失败：${message}`);
+    } finally {
+      setIsChangingStatus(false);
     }
   };
 
-  const handleEndInterview = async () => {
-    if (!currentRoom) return;
-    try {
-      const updatedRoom = await updateRoomStatus(currentRoom.id, 'COMPLETED');
-      setCurrentRoom(updatedRoom);
-    } catch (error) {
-      console.error('Failed to end interview:', error);
-    }
-  };
+  const handleStartInterview = () => changeStatus('ACTIVE', '开始');
+
+  const handleEndInterview = () => changeStatus('COMPLETED', '完成');
+
+  const handleCancelInterview = () => changeStatus('CANCELLED', '取消');
 
   const handleBack = () => {
     resetRoom();
@@ -233,7 +268,7 @@ export const InterviewerRoomView: React.FC = () => {
     );
   }
 
-  if (!currentRoom) {
+  if (!currentRoom && roomNotFound) {
     return (
       <div style={{
         display: 'flex',
@@ -244,7 +279,8 @@ export const InterviewerRoomView: React.FC = () => {
         flexDirection: 'column',
         gap: '16px',
       }}>
-        <div style={{ color: '#f44336', fontSize: '16px' }}>房间不存在</div>
+        <div style={{ fontSize: '40px' }}>🔍</div>
+        <div style={{ color: '#f44336', fontSize: '16px' }}>房间不存在或已被删除</div>
         <button
           onClick={handleBack}
           style={{
@@ -261,6 +297,52 @@ export const InterviewerRoomView: React.FC = () => {
     );
   }
 
+  if (!currentRoom) {
+    return (
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        height: '100vh',
+        background: '#0d0d0d',
+        flexDirection: 'column',
+        gap: '16px',
+      }}>
+        <div style={{ fontSize: '40px' }}>⚠️</div>
+        <div style={{ color: '#f44336', fontSize: '15px' }}>房间详情加载失败</div>
+        <div style={{ color: '#888', fontSize: '13px', maxWidth: '400px', textAlign: 'center', wordBreak: 'break-word' }}>
+          {loadError || '请检查网络连接后重试'}
+        </div>
+        <div style={{ display: 'flex', gap: '12px' }}>
+          <button
+            onClick={() => fetchRoomDetails()}
+            style={{
+              padding: '10px 24px',
+              background: '#2196f3',
+              color: '#fff',
+              border: 'none',
+              borderRadius: '6px',
+              cursor: 'pointer',
+            }}>
+            重试
+          </button>
+          <button
+            onClick={handleBack}
+            style={{
+              padding: '10px 24px',
+              background: 'transparent',
+              color: '#888',
+              border: '1px solid #555',
+              borderRadius: '6px',
+              cursor: 'pointer',
+            }}>
+            返回首页
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (!currentProblem) {
     return (
       <div style={{
@@ -272,19 +354,38 @@ export const InterviewerRoomView: React.FC = () => {
         flexDirection: 'column',
         gap: '16px',
       }}>
-        <div style={{ color: '#ff9800', fontSize: '16px' }}>题目加载失败，请稍后重试</div>
-        <button
-          onClick={handleBack}
-          style={{
-            padding: '10px 24px',
-            background: '#2196f3',
-            color: '#fff',
-            border: 'none',
-            borderRadius: '6px',
-            cursor: 'pointer',
-          }}>
-          返回首页
-        </button>
+        <div style={{ fontSize: '40px' }}>{problemError ? '⚠️' : '⏳'}</div>
+        <div style={{ color: problemError ? '#ff9800' : '#fff', fontSize: '16px' }}>
+          {problemError ? '题目加载失败' : '题目加载中...'}
+        </div>
+        {problemError && (
+          <div style={{ display: 'flex', gap: '12px' }}>
+            <button
+              onClick={() => fetchRoomDetails()}
+              style={{
+                padding: '10px 24px',
+                background: '#2196f3',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '6px',
+                cursor: 'pointer',
+              }}>
+              重试
+            </button>
+            <button
+              onClick={handleBack}
+              style={{
+                padding: '10px 24px',
+                background: 'transparent',
+                color: '#888',
+                border: '1px solid #555',
+                borderRadius: '6px',
+                cursor: 'pointer',
+              }}>
+              返回首页
+            </button>
+          </div>
+        )}
       </div>
     );
   }
@@ -516,55 +617,62 @@ export const InterviewerRoomView: React.FC = () => {
               房间码: <span style={{ color: '#4caf50', fontFamily: 'monospace', fontWeight: 'bold', letterSpacing: '1px' }}>{currentRoom.roomCode}</span>
             </div>
             {currentRoom.status === 'WAITING' && (
-              <button
-                onClick={handleStartInterview}
-                style={{
-                  padding: '10px 24px',
-                  background: 'linear-gradient(135deg, #4caf50, #45a049)',
-                  color: '#fff',
-                  border: 'none',
-                  borderRadius: '8px',
-                  cursor: 'pointer',
-                  fontSize: '14px',
-                  fontWeight: 600,
-                  boxShadow: '0 4px 12px rgba(76, 175, 80, 0.3)',
-                  transition: 'all 0.2s',
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.transform = 'translateY(-1px)';
-                  e.currentTarget.style.boxShadow = '0 6px 16px rgba(76, 175, 80, 0.4)';
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.transform = 'translateY(0)';
-                  e.currentTarget.style.boxShadow = '0 4px 12px rgba(76, 175, 80, 0.3)';
-                }}>
-                ▶ 开始面试
-              </button>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  onClick={handleCancelInterview}
+                  disabled={isChangingStatus}
+                  title="取消后房间不可恢复"
+                  style={{
+                    padding: '10px 20px',
+                    background: 'transparent',
+                    color: '#f44336',
+                    border: '1px solid #f44336',
+                    borderRadius: '8px',
+                    cursor: isChangingStatus ? 'not-allowed' : 'pointer',
+                    fontSize: '14px',
+                    fontWeight: 600,
+                    opacity: isChangingStatus ? 0.6 : 1,
+                  }}>
+                  取消面试
+                </button>
+                <button
+                  onClick={handleStartInterview}
+                  disabled={isChangingStatus}
+                  style={{
+                    padding: '10px 24px',
+                    background: 'linear-gradient(135deg, #4caf50, #45a049)',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: '8px',
+                    cursor: isChangingStatus ? 'not-allowed' : 'pointer',
+                    fontSize: '14px',
+                    fontWeight: 600,
+                    boxShadow: '0 4px 12px rgba(76, 175, 80, 0.3)',
+                    transition: 'all 0.2s',
+                    opacity: isChangingStatus ? 0.7 : 1,
+                  }}>
+                  {isChangingStatus ? '处理中...' : '▶ 开始面试'}
+                </button>
+              </div>
             )}
             {currentRoom.status === 'ACTIVE' && (
               <button
                 onClick={handleEndInterview}
+                disabled={isChangingStatus}
                 style={{
                   padding: '10px 24px',
                   background: 'linear-gradient(135deg, #f44336, #e53935)',
                   color: '#fff',
                   border: 'none',
                   borderRadius: '8px',
-                  cursor: 'pointer',
+                  cursor: isChangingStatus ? 'not-allowed' : 'pointer',
                   fontSize: '14px',
                   fontWeight: 600,
                   boxShadow: '0 4px 12px rgba(244, 67, 54, 0.3)',
                   transition: 'all 0.2s',
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.transform = 'translateY(-1px)';
-                  e.currentTarget.style.boxShadow = '0 6px 16px rgba(244, 67, 54, 0.4)';
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.transform = 'translateY(0)';
-                  e.currentTarget.style.boxShadow = '0 4px 12px rgba(244, 67, 54, 0.3)';
+                  opacity: isChangingStatus ? 0.7 : 1,
                 }}>
-                ⏹ 结束面试
+                {isChangingStatus ? '处理中...' : '⏹ 完成面试'}
               </button>
             )}
             {currentRoom.status === 'COMPLETED' && (
@@ -578,6 +686,19 @@ export const InterviewerRoomView: React.FC = () => {
                 fontWeight: 500,
               }}>
                 面试已完成
+              </div>
+            )}
+            {currentRoom.status === 'CANCELLED' && (
+              <div style={{
+                padding: '8px 16px',
+                background: 'rgba(244, 67, 54, 0.1)',
+                border: '1px solid rgba(244, 67, 54, 0.3)',
+                borderRadius: '6px',
+                fontSize: '13px',
+                color: '#f44336',
+                fontWeight: 500,
+              }}>
+                面试已取消
               </div>
             )}
           </div>

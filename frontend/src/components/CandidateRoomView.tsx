@@ -25,12 +25,16 @@ const CandidateRoomView: React.FC = () => {
     setStatusChangeNotification,
   } = useInterviewStore();
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [roomNotFound, setRoomNotFound] = useState(false);
+  const [problemError, setProblemError] = useState(false);
   const [participantsPanelOpen, setParticipantsPanelOpen] = useState(false);
   const [problemPanelWidth, setProblemPanelWidth] = useState(380);
   const [isDragging, setIsDragging] = useState(false);
   const [duration, setDuration] = useState<string>('');
   const [localStatusNotification, setLocalStatusNotification] = useState<StatusChangeNotification | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const roomFetchSeqRef = useRef(0);
   const minPanelWidth = 300;
   const maxPanelWidth = 600;
   const durationTimerRef = useRef<number | null>(null);
@@ -38,15 +42,31 @@ const CandidateRoomView: React.FC = () => {
 
   const fetchRoomDetails = useCallback(async () => {
     if (!roomId) return;
+    const seq = ++roomFetchSeqRef.current;
     try {
       const data = await getRoomById(roomId);
+      if (seq !== roomFetchSeqRef.current) return;
       setCurrentRoom(data);
+      setRoomNotFound(false);
+      setLoadError('');
       if (data.problemId) {
-        const problem = await getProblemById(data.problemId);
-        setProblem(problem);
+        try {
+          const problem = await getProblemById(data.problemId);
+          setProblem(problem);
+          setProblemError(false);
+        } catch (problemErr) {
+          console.error('Failed to fetch problem:', problemErr);
+          setProblemError(true);
+        }
       }
-    } catch (error) {
+    } catch (error: any) {
+      if (seq !== roomFetchSeqRef.current) return;
       console.error('Failed to fetch room details:', error);
+      if (error?.status === 404) {
+        setRoomNotFound(true);
+      } else {
+        setLoadError(error instanceof Error ? error.message : '房间详情加载失败');
+      }
     }
   }, [roomId, setCurrentRoom, setProblem]);
 
@@ -174,16 +194,14 @@ const CandidateRoomView: React.FC = () => {
     const init = async () => {
       setLoading(true);
       try {
-        if (!currentRoom && roomId) {
-          await fetchRoomDetails();
-        }
+        await fetchRoomDetails();
         await fetchParticipants();
 
         if (currentUser && roomId) {
           try {
             await connect(roomId, currentUser);
           } catch (error) {
-            console.error('WebSocket connection failed:', error);
+            console.warn('WebSocket unavailable:', error);
           }
         }
       } finally {
@@ -244,7 +262,7 @@ const CandidateRoomView: React.FC = () => {
       }
       disconnect();
     };
-  }, [roomId, currentUser, currentRoom, fetchRoomDetails, fetchParticipants, sendHttpHeartbeat, setCurrentRoom, setParticipants]);
+  }, [roomId, currentUser, fetchRoomDetails, fetchParticipants, sendHttpHeartbeat, setCurrentRoom, setParticipants]);
 
   if (loading) {
     return (
@@ -262,6 +280,7 @@ const CandidateRoomView: React.FC = () => {
   }
 
   if (!currentRoom) {
+    const isNotFound = roomNotFound;
     return (
       <div style={{
         minHeight: '100vh',
@@ -277,17 +296,36 @@ const CandidateRoomView: React.FC = () => {
           padding: '32px',
           textAlign: 'center',
           border: '1px solid #333',
+          maxWidth: '420px',
         }}>
-          <div style={{ fontSize: '48px', marginBottom: '16px' }}>⚠️</div>
-          <h2 style={{ color: '#fff', margin: '0 0 8px 0' }}>房间不存在</h2>
-          <p style={{ color: '#888', margin: '0 0 24px 0' }}>请检查链接是否正确</p>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>{isNotFound ? '🔍' : '⚠️'}</div>
+          <h2 style={{ color: '#fff', margin: '0 0 8px 0' }}>{isNotFound ? '房间不存在' : '房间详情加载失败'}</h2>
+          <p style={{ color: '#888', margin: '0 0 24px 0', wordBreak: 'break-word' }}>
+            {isNotFound ? '请检查链接是否正确' : (loadError || '请检查网络连接后重试')}
+          </p>
+          {!isNotFound && (
+            <button
+              onClick={() => fetchRoomDetails()}
+              style={{
+                padding: '10px 24px',
+                background: '#2196f3',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '14px',
+                marginRight: '8px',
+              }}>
+              重试
+            </button>
+          )}
           <button
             onClick={handleBack}
             style={{
               padding: '10px 24px',
-              background: '#2196f3',
-              color: '#fff',
-              border: 'none',
+              background: isNotFound ? '#2196f3' : 'transparent',
+              color: isNotFound ? '#fff' : '#888',
+              border: isNotFound ? 'none' : '1px solid #555',
               borderRadius: '6px',
               cursor: 'pointer',
               fontSize: '14px',
@@ -316,22 +354,54 @@ const CandidateRoomView: React.FC = () => {
           textAlign: 'center',
           border: '1px solid #333',
         }}>
-          <div style={{ fontSize: '48px', marginBottom: '16px' }}>📋</div>
-          <h2 style={{ color: '#fff', margin: '0 0 8px 0' }}>题目加载中...</h2>
-          <p style={{ color: '#888', margin: '0 0 24px 0' }}>请稍候</p>
-          <button
-            onClick={handleBack}
-            style={{
-              padding: '10px 24px',
-              background: '#2196f3',
-              color: '#fff',
-              border: 'none',
-              borderRadius: '6px',
-              cursor: 'pointer',
-              fontSize: '14px',
-            }}>
-            返回首页
-          </button>
+          <div style={{ fontSize: '48px', marginBottom: '16px' }}>{problemError ? '⚠️' : '📋'}</div>
+          <h2 style={{ color: '#fff', margin: '0 0 8px 0' }}>{problemError ? '题目加载失败' : '题目加载中...'}</h2>
+          <p style={{ color: '#888', margin: '0 0 24px 0' }}>{problemError ? '请稍后重试' : '请稍候'}</p>
+          {problemError ? (
+            <>
+              <button
+                onClick={() => fetchRoomDetails()}
+                style={{
+                  padding: '10px 24px',
+                  background: '#2196f3',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                  marginRight: '8px',
+                }}>
+                重试
+              </button>
+              <button
+                onClick={handleBack}
+                style={{
+                  padding: '10px 24px',
+                  background: 'transparent',
+                  color: '#888',
+                  border: '1px solid #555',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                }}>
+                返回首页
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={handleBack}
+              style={{
+                padding: '10px 24px',
+                background: '#2196f3',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '14px',
+              }}>
+              返回首页
+            </button>
+          )}
         </div>
       </div>
     );
@@ -591,6 +661,20 @@ const CandidateRoomView: React.FC = () => {
                 whiteSpace: 'nowrap',
               }}>
                 面试已完成
+              </div>
+            )}
+            {currentRoom.status === 'CANCELLED' && (
+              <div style={{
+                padding: '8px 16px',
+                background: 'rgba(244, 67, 54, 0.1)',
+                border: '1px solid rgba(244, 67, 54, 0.3)',
+                borderRadius: '6px',
+                fontSize: '13px',
+                color: '#f44336',
+                fontWeight: 500,
+                whiteSpace: 'nowrap',
+              }}>
+                面试已取消
               </div>
             )}
           </div>
