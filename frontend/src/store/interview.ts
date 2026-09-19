@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { Problem, Submission, InterviewRoom, User, CandidateInvitation, ParticipantStatus, getDefaultCodeByLanguage } from '../types';
+import { Problem, Submission, InterviewRoom, User, CandidateInvitation, ParticipantStatus, getDefaultCodeByLanguage, isRoomStatusRegression } from '../types';
 
 export interface ExecutionResult {
   success: boolean;
@@ -113,9 +113,33 @@ export const useInterviewStore = create<InterviewState>((set) => ({
   addSubmission: (s) => set({ submissions: [s, ...useInterviewStore.getState().submissions] }),
   setRoom: (room) => set({ deprecatedRoom: room, room, currentRoom: room }),
   setCurrentUser: (user) => set({ currentUser: user }),
-  setMyRooms: (rooms) => set({ myRooms: rooms }),
+  setMyRooms: (rooms) => set((state) => ({
+    // 与详情共用同一状态口径：已前进的状态（等待→进行→完成/取消）不允许被旧数据覆盖倒退
+    myRooms: rooms.map((room) => {
+      const existing = state.myRooms.find((r) => r.id === room.id);
+      if (existing && isRoomStatusRegression(existing.status, room.status)) {
+        return {
+          ...room,
+          status: existing.status,
+          startedAt: existing.startedAt ?? room.startedAt,
+          endedAt: existing.endedAt ?? room.endedAt,
+        };
+      }
+      return room;
+    }),
+  })),
   setCurrentRoom: (room) => set((state) => {
     const oldRoom = state.currentRoom;
+    if (oldRoom && room && oldRoom.id === room.id && isRoomStatusRegression(oldRoom.status, room.status)) {
+      // 忽略会倒退的陈旧状态（如离线缓存、竞态响应），保留当前状态与时间戳
+      const merged = {
+        ...room,
+        status: oldRoom.status,
+        startedAt: oldRoom.startedAt ?? room.startedAt,
+        endedAt: oldRoom.endedAt ?? room.endedAt,
+      };
+      return { currentRoom: merged, deprecatedRoom: merged, room: merged };
+    }
     if (oldRoom && room && oldRoom.status !== room.status) {
       const notification: StatusChangeNotification = {
         id: `status-change-${Date.now()}`,

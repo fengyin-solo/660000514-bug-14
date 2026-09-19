@@ -283,6 +283,26 @@ export const getRoomStatusConfig = (status: string): RoomStatusConfig => {
   return ROOM_STATUS_CONFIGS.find(s => s.value === status) || ROOM_STATUS_CONFIGS[0];
 };
 
+/**
+ * 房间状态机：WAITING → ACTIVE → COMPLETED / CANCELLED。
+ * 列表与详情共用这一套口径：状态只能前进不能倒退，终态（已完成/已取消）不可再变更。
+ */
+export const ROOM_STATUS_ORDER: Record<InterviewRoom['status'], number> = {
+  WAITING: 0,
+  ACTIVE: 1,
+  COMPLETED: 2,
+  CANCELLED: 2,
+};
+
+export const isRoomStatusRegression = (
+  current: InterviewRoom['status'],
+  next: InterviewRoom['status'],
+): boolean => {
+  if (current === next) return false;
+  if (current === 'COMPLETED' || current === 'CANCELLED') return true;
+  return ROOM_STATUS_ORDER[next] < ROOM_STATUS_ORDER[current];
+};
+
 export const formatDuration = (startTime: string, endTime?: string): string => {
   const start = new Date(startTime).getTime();
   const end = endTime ? new Date(endTime).getTime() : Date.now();

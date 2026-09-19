@@ -121,9 +121,14 @@ export async function mockUpdateRoomStatus(roomId: string, status: string): Prom
     throw new Error('房间不存在');
   }
 
+  // 与后端口径一致：进入 ACTIVE 记录开始时间，进入 COMPLETED/CANCELLED 记录结束时间，均只记录一次
+  const now = new Date().toISOString();
+  const current = rooms[index];
   const updatedRoom: InterviewRoom = {
-    ...rooms[index],
+    ...current,
     status: status as InterviewRoom['status'],
+    startedAt: status === 'ACTIVE' ? (current.startedAt ?? now) : current.startedAt,
+    endedAt: (status === 'COMPLETED' || status === 'CANCELLED') ? (current.endedAt ?? now) : current.endedAt,
   };
 
   roomsCache = [...rooms];
